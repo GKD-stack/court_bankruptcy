@@ -17,9 +17,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install DuckDB and Dependencies
+      - name: Install Streaming Dependencies
         run: |
-          pip install duckdb pandas
+          python -m pip install --upgrade pip
+          python -m pip install boto3 pandas pyarrow
 
       - name: Execute High-Performance S3 Stream
         run: |
