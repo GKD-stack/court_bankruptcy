@@ -1,39 +1,64 @@
+import urllib.request
+import bz2
 import duckdb
+import io
 
-print("Initializing cloud-optimized analytical engine...")
-con = duckdb.connect(database=':memory:')
+print("Initializing high-performance streaming architecture...")
 
-# Load the secure HTTP streaming extension
-con.execute("INSTALL httpfs; LOAD httpfs;")
-
-# Fix: Route directly to the us-west-2 data center where CourtListener lives
-# This prevents AWS from throwing a hidden 301 redirection block
-https_path = "https://amazonaws.com"
+# Target URL for CourtListener data repository
+url = "https://amazonaws.com"
 output_parquet = "scalable_bankruptcy_dockets.parquet"
 
-print("Streaming and filtering directly from S3-us-west-2 via HTTPS...")
+# Establish connection parameters
+con = duckdb.connect(database=':memory:')
 
-# Set all_varchar=True so dirty text rows don't disrupt parsing
-query = f"""
-    COPY (
-        SELECT * 
-        FROM read_csv(
-            '{https_path}', 
-            compression='bz2', 
-            ignore_errors=true,
-            header=true,
-            all_varchar=true
-        )
-        WHERE lower(case_name) LIKE '%bankruptcy%'
-           OR lower(case_name) LIKE '%chapter 11%'
-           OR lower(case_name) LIKE '%restructuring%'
-        LIMIT 5000
-    ) TO '{output_parquet}' (FORMAT 'PARQUET');
-"""
+print("Opening continuous network connection to S3...")
+request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
 
-try:
-    con.execute(query)
-    print(f"Success! Scalable storage file generated: {output_parquet}")
-except Exception as e:
-    print(f"\n[STREAM ERROR] Execution failed: {e}")
-    raise e
+with urllib.request.urlopen(request) as response:
+    print("Stream connected. Initializing live bz2 decompressor loop...")
+    
+    # Python streams and decompresses the raw bytes into memory on-the-fly
+    with bz2.BZ2Decompressor() as decompressor:
+        
+        # We process the first 100MB of raw text data to secure our subset sample
+        # This keeps our GitHub memory footprint extremely light
+        chunk_size = 1024 * 1024 * 50 # 50 Megabytes per network buffer
+        raw_text_buffer = io.BytesIO()
+        bytes_processed = 0
+        max_bytes_to_process = 1024 * 1024 * 150 # Cap at 150MB of raw CSV text data
+
+        while bytes_processed < max_bytes_to_process:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+                
+            decompressed_data = decompressor.decompress(chunk)
+            raw_text_buffer.write(decompressed_data)
+            bytes_processed += len(decompressed_data)
+            print(f"-> Decompressed stream buffer: {bytes_processed / (1024*1024):.1f} MB processed...")
+
+        print("\nHanding text stream directly over to the DuckDB parser...")
+        raw_text_buffer.seek(0)
+        
+        # Read the raw text buffer using a virtual CSV interface inside DuckDB
+        csv_wrapper = io.TextIOWrapper(raw_text_buffer, encoding='utf-8', errors='ignore')
+        
+        # Register the text stream as a virtual memory table
+        con.register_object('virtual_csv_stream', csv_wrapper)
+
+        print("Executing analytical query and compressing to Parquet...")
+        query = f"""
+            COPY (
+                SELECT * 
+                FROM read_csv('virtual_csv_stream', ignore_errors=true, header=true, all_varchar=true)
+                WHERE lower(case_name) LIKE '%bankruptcy%'
+                   OR lower(case_name) LIKE '%chapter 11%'
+                   OR lower(case_name) LIKE '%restructuring%'
+                LIMIT 5000
+            ) TO '{output_parquet}' (FORMAT 'PARQUET');
+        """
+        
+        con.execute(query)
+        print(f"\n[SUCCESS] Production file generated successfully: {output_parquet}")
+
