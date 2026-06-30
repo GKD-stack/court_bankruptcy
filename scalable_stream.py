@@ -6,14 +6,14 @@ con = duckdb.connect(database=':memory:')
 # Load the secure HTTP streaming extension
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
-# Fix: Convert the s3:// path to a direct public https:// URL 
-# This completely bypasses signature/credential checks on the GitHub runner
+# Fix: Route directly to the us-west-2 data center where CourtListener lives
+# This prevents AWS from throwing a hidden 301 redirection block
 https_path = "https://amazonaws.com"
 output_parquet = "scalable_bankruptcy_dockets.parquet"
 
-print("Streaming and filtering directly from S3 via HTTPS...")
+print("Streaming and filtering directly from S3-us-west-2 via HTTPS...")
 
-# Fix: Set all_varchar=True to handle messy court data without type parsing errors
+# Set all_varchar=True so dirty text rows don't disrupt parsing
 query = f"""
     COPY (
         SELECT * 
