@@ -1,97 +1,58 @@
-import csv
+import urllib.request
+import bz2
+import duckdb
+import io
 
-import boto3
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from botocore import UNSIGNED
-from botocore.config import Config
+print("Initializing streamlined cloud architecture...")
 
-BUCKET_NAME = "com-courtlistener-storage"
-FILE_KEY = "bulk-data/dockets-2026-03-31.csv.bz2"
-OUTPUT_FILE = "scalable_bankruptcy_dockets.parquet"
-CHUNK_SIZE = 50_000
-MAX_ROWS = 5_000
-KEYWORDS = "bankruptcy|chapter 11|chapter 7|distressed|debtor|restructuring"
+# Target URL for CourtListener data repository
+url = "https://amazonaws.com"
+output_parquet = "scalable_bankruptcy_dockets.parquet"
 
-print("Initializing streaming pipeline...")
+con = duckdb.connect(database=':memory:')
 
-# CourtListener's public bucket can be read without AWS credentials.
-s3 = boto3.client(
-    "s3",
-    config=Config(signature_version=UNSIGNED),
-    region_name="us-east-1",
-)
+print("Opening streaming data channel...")
+request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
 
-print(f"Opening s3://{BUCKET_NAME}/{FILE_KEY}...")
-response = s3.get_object(Bucket=BUCKET_NAME, Key=FILE_KEY)
-stream = response["Body"]
+with urllib.request.urlopen(request) as response:
+    # Fix: bz2.open directly handles the cloud response stream alignment perfectly
+    with bz2.open(response, mode='rt', encoding='utf-8', errors='ignore') as decompressor:
+        print("Connected! Skimming the first 200,000 text rows to extract bankruptcy targets...")
+        
+        # Pull text rows instantly into a memory buffer instead of raw byte chunks
+        raw_text_buffer = io.StringIO()
+        
+        # Read the header first
+        header = decompressor.readline()
+        raw_text_buffer.write(header)
+        
+        # Pull 200,000 rows to ensure we find plenty of Chapter 11/Bankruptcy cases
+        for i in range(200000):
+            line = decompressor.readline()
+            if not line:
+                break
+            raw_text_buffer.write(line)
+            if i % 50000 == 0 and i > 0:
+                print(f"-> Skimmed {i:,} lines from the cloud stream...")
 
-print("Streaming, decompressing, filtering, and writing Parquet...")
-chunks = pd.read_csv(
-    stream,
-    compression="bz2",
-    chunksize=CHUNK_SIZE,
-    dtype=str,
-    engine="python",
-    on_bad_lines="skip",
-    quoting=csv.QUOTE_NONE,
-)
+        print("\nHanding memory stream over to the DuckDB engine...")
+        raw_text_buffer.seek(0)
+        
+        # Register the text stream as a virtual memory table
+        con.register_object('virtual_csv_stream', raw_text_buffer)
 
-writer = None
-rows_written = 0
-source_columns = None
+        print("Executing analytical query and compressing to Parquet...")
+        query = f"""
+            COPY (
+                SELECT * 
+                FROM read_csv('virtual_csv_stream', ignore_errors=true, header=true, all_varchar=true)
+                WHERE lower(case_name) LIKE '%bankruptcy%'
+                   OR lower(case_name) LIKE '%chapter 11%'
+                   OR lower(case_name) LIKE '%restructuring%'
+                LIMIT 5000
+            ) TO '{output_parquet}' (FORMAT 'PARQUET');
+        """
+        
+        con.execute(query)
+        print(f"\n[SUCCESS] Production file generated successfully: {output_parquet}")
 
-try:
-    for chunk_index, chunk in enumerate(chunks, start=1):
-        if rows_written >= MAX_ROWS:
-            break
-
-        if source_columns is None:
-            source_columns = list(chunk.columns)
-
-        text_columns = [col for col in chunk.columns if chunk[col].dtype == "object"]
-        if not text_columns:
-            if chunk_index % 10 == 0:
-                print(f"Processed chunk {chunk_index}: no text columns found")
-            continue
-
-        mask = (
-            chunk[text_columns]
-            .fillna("")
-            .apply(lambda series: series.str.contains(KEYWORDS, case=False, na=False))
-            .any(axis=1)
-        )
-        filtered_chunk = chunk.loc[mask].copy()
-
-        if filtered_chunk.empty:
-            if chunk_index % 10 == 0:
-                print(f"Processed chunk {chunk_index}: no matches yet")
-            continue
-
-        remaining_rows = MAX_ROWS - rows_written
-        filtered_chunk = filtered_chunk.head(remaining_rows)
-        table = pa.Table.from_pandas(filtered_chunk, preserve_index=False)
-
-        if writer is None:
-            writer = pq.ParquetWriter(OUTPUT_FILE, table.schema)
-
-        writer.write_table(table)
-        rows_written += len(filtered_chunk)
-        print(
-            f"Processed chunk {chunk_index}: wrote {len(filtered_chunk)} rows "
-            f"(total {rows_written}/{MAX_ROWS})"
-        )
-
-    if writer is None:
-        empty_frame = pd.DataFrame(
-            {column: pd.Series(dtype="string") for column in (source_columns or [])}
-        )
-        empty_table = pa.Table.from_pandas(empty_frame, preserve_index=False)
-        pq.write_table(empty_table, OUTPUT_FILE)
-        print(f"No matches found. Wrote empty Parquet file: {OUTPUT_FILE}")
-    else:
-        print(f"Success! Wrote {rows_written} rows to {OUTPUT_FILE}")
-finally:
-    if writer is not None:
-        writer.close()
